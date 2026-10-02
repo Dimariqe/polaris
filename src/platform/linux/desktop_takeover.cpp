@@ -149,6 +149,34 @@ namespace desktop_takeover {
       return result.exit_status == 0 && !result.timed_out && !result.truncated;
     }
 
+    // hyprctl exits 0 having done nothing whenever a request meets the wrong
+    // config parser: eval on a legacy config answers "eval is only supported
+    // with the lua config manager" ("unknown request" before 0.55), and
+    // keyword on a Lua config answers "keyword can't work with non-legacy
+    // parsers" — both with rc=0. A trimmed "ok" reply is what tells a real
+    // success from those, so both forms require it, and callers still verify
+    // by observation.
+    bool hyprctl_replies_ok(const std::vector<std::string> &argv) {
+      const auto result = platf::run_process_argv_capture(
+        argv,
+        helper_timeout,
+        4096,
+        {},
+        true
+      );
+      constexpr auto is_space = [](char ch) {
+        return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
+      };
+      std::string_view reply {result.output};
+      while (!reply.empty() && is_space(reply.front())) {
+        reply.remove_prefix(1);
+      }
+      while (!reply.empty() && is_space(reply.back())) {
+        reply.remove_suffix(1);
+      }
+      return result.exit_status == 0 && !result.timed_out && !result.truncated && reply == "ok";
+    }
+
     // Classic `hyprctl dispatch A B` is evaluated by a Hyprland with a Lua
     // config as the Lua expression `hl.dispatch(A B)`, so every dispatch
     // fails with a Lua syntax error (rc=7) and takeover could neither begin
@@ -190,6 +218,21 @@ namespace desktop_takeover {
         return false;
       }
       return dispatch({"dpms", enabled ? "on" : "off", std::string {monitor}});
+    }
+
+    bool set_monitor_enabled(const monitor_state_t &monitor, bool enabled) {
+      if (!safe_token(monitor.name)) {
+        return false;
+      }
+      const auto lua_state = lua_monitor_state(monitor, enabled);
+      if (lua_state.has_value() &&
+          hyprctl_replies_ok({"hyprctl", "eval", *lua_state})) {
+        return true;
+      }
+      // The keyword form is the legacy-config spelling; it only runs after
+      // eval failed to answer ok, which on a Lua config is every time.
+      return hyprctl_replies_ok({"hyprctl", "keyword", "monitor",
+                                 monitor.name + (enabled ? ",enable" : ",disable")});
     }
 
     bool move_workspace(const workspace_state_t &workspace, std::string_view monitor) {
@@ -304,6 +347,29 @@ namespace desktop_takeover {
           }
           monitor.dpms_on = item["dpmsStatus"].get<bool>();
         }
+        if (item.contains("x") && item["x"].is_number_integer()) {
+          monitor.x = item["x"].get<int>();
+        }
+        if (item.contains("y") && item["y"].is_number_integer()) {
+          monitor.y = item["y"].get<int>();
+        }
+        if (item.contains("scale") && item["scale"].is_number()) {
+          monitor.scale = item["scale"].get<double>();
+          if (monitor.scale <= 0) {
+            monitor.scale = 1.0;
+          }
+        }
+        if (item.contains("width") && item["width"].is_number_integer() &&
+            item.contains("height") && item["height"].is_number_integer()) {
+          monitor.mode = std::to_string(item["width"].get<int>()) + "x" +
+                         std::to_string(item["height"].get<int>());
+          if (item.contains("refreshRate") && item["refreshRate"].is_number()) {
+            const auto refresh = std::lround(item["refreshRate"].get<double>());
+            if (refresh > 0) {
+              monitor.mode += "@" + std::to_string(refresh);
+            }
+          }
+        }
         monitors.emplace_back(std::move(monitor));
       }
       return monitors;
@@ -380,6 +446,23 @@ namespace desktop_takeover {
         if (!safe_token(monitor.name)) {
           return std::nullopt;
         }
+        // Geometry is optional so a record written before it was recorded
+        // still reads back; enabling then re-states only what it knows.
+        if (item.contains("x") && item["x"].is_number_integer()) {
+          monitor.x = item["x"].get<int>();
+        }
+        if (item.contains("y") && item["y"].is_number_integer()) {
+          monitor.y = item["y"].get<int>();
+        }
+        if (item.contains("mode") && item["mode"].is_string()) {
+          monitor.mode = item["mode"].get<std::string>();
+        }
+        if (item.contains("scale") && item["scale"].is_number()) {
+          monitor.scale = item["scale"].get<double>();
+          if (monitor.scale <= 0) {
+            monitor.scale = 1.0;
+          }
+        }
         state.monitors.emplace_back(std::move(monitor));
       }
       for (const auto &item : root["workspaces"]) {
@@ -424,6 +507,10 @@ namespace desktop_takeover {
       root["monitors"].push_back({
         {"name", monitor.name},
         {"dpms_on", monitor.dpms_on},
+        {"x", monitor.x},
+        {"y", monitor.y},
+        {"mode", monitor.mode},
+        {"scale", monitor.scale},
       });
     }
     for (const auto &workspace : state.workspaces) {
@@ -452,6 +539,20 @@ namespace desktop_takeover {
     return std::nullopt;
   }
 
+  // Lua double-quoted string literal: the only two characters that can end
+  // the string early or change what it means are backslash and double quote.
+  std::string lua_quote(std::string_view value) {
+    std::string quoted = "\"";
+    for (const char ch : value) {
+      if (ch == '\\' || ch == '"') {
+        quoted += '\\';
+      }
+      quoted += ch;
+    }
+    quoted += '"';
+    return quoted;
+  }
+
   std::optional<std::string> lua_dispatcher(const std::vector<std::string> &arguments) {
     // The quoting below is only as trustworthy as its input is nameable:
     // refuse anything safe_token refuses, so a caller that skips its own
@@ -461,17 +562,6 @@ namespace desktop_takeover {
         return std::nullopt;
       }
     }
-    const auto lua_quote = [](std::string_view value) {
-      std::string quoted = "\"";
-      for (const char ch : value) {
-        if (ch == '\\' || ch == '"') {
-          quoted += '\\';
-        }
-        quoted += ch;
-      }
-      quoted += '"';
-      return quoted;
-    };
 
     // Only the dispatches takeover issues; a new one is a translation to write
     // deliberately, not a pattern to guess at.
@@ -488,6 +578,28 @@ namespace desktop_takeover {
              ", monitor = " + lua_quote(arguments[2]) + " })";
     }
     return std::nullopt;
+  }
+
+  std::optional<std::string> lua_monitor_state(const monitor_state_t &monitor, bool enabled) {
+    if (!safe_token(monitor.name)) {
+      return std::nullopt;
+    }
+    // Hyprland's position is two integers joined by an x; %g keeps a scale of
+    // 2 an integer and 1.25 a decimal, the way a Lua number reads best.
+    char scale_text[32];
+    std::snprintf(scale_text, sizeof(scale_text), "%g", monitor.scale);
+    std::string expression = "hl.monitor({ output = " + lua_quote(monitor.name) +
+                             ", disabled = " + (enabled ? "false" : "true");
+    if (enabled) {
+      expression += ", position = \"" + std::to_string(monitor.x) + "x" +
+                    std::to_string(monitor.y) + "\"";
+      if (!monitor.mode.empty()) {
+        expression += ", mode = " + lua_quote(monitor.mode);
+      }
+      expression += ", scale = " + std::string {scale_text};
+    }
+    expression += " })";
+    return expression;
   }
 
   bool takeover_layout_matches(
@@ -575,7 +687,10 @@ namespace desktop_takeover {
     state.active = true;
     state.target_output = std::string {target_output};
     for (const auto &monitor : *observed_monitors) {
-      if (monitor.state.name != target_output && !monitor.disabled && monitor.state.dpms_on) {
+      // Every physical output leaves the layout for the session — lit or
+      // already asleep — so the pointer has nowhere to escape to; the
+      // recorded dpms state and geometry put each one back the way it was.
+      if (monitor.state.name != target_output && !monitor.disabled) {
         state.monitors.push_back(monitor.state);
         if (state.fallback_monitor.empty() || monitor.focused) {
           state.fallback_monitor = monitor.state.name;
@@ -679,9 +794,43 @@ namespace desktop_takeover {
       return rollback("Desktop Takeover could not verify monitor power state; Polaris is restoring the prior layout.");
     }
 
+    // Power alone leaves the monitors in the layout: dpms is a panel state,
+    // so the pointer can still travel onto a dark output and drag focus
+    // there. Taking the outputs off the layout confines the pointer to the
+    // streamed output for the whole session.
+    for (const auto &monitor : state.monitors) {
+      if (!set_monitor_enabled(monitor, false)) {
+        return rollback("Desktop Takeover could not take every physical monitor off the layout; Polaris is restoring the prior layout.");
+      }
+    }
+    bool off_canvas = false;
+    int consecutive_absences = 0;
+    const auto off_canvas_deadline = std::chrono::steady_clock::now() + std::chrono::seconds {4};
+    for (int attempt = 0; attempt < 20 && std::chrono::steady_clock::now() < off_canvas_deadline; ++attempt) {
+      const auto observed = observe_monitors();
+      const bool absent = observed &&
+        std::none_of(observed->begin(), observed->end(), [&](const auto &candidate) {
+          return std::any_of(state.monitors.begin(), state.monitors.end(), [&](const auto &recorded) {
+            return recorded.name == candidate.state.name;
+          });
+        });
+      if (absent) {
+        if (++consecutive_absences >= 2) {
+          off_canvas = true;
+          break;
+        }
+      } else {
+        consecutive_absences = 0;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds {50});
+    }
+    if (!off_canvas) {
+      return rollback("Desktop Takeover could not verify the physical monitors left the layout; Polaris is restoring the prior layout.");
+    }
+
     BOOST_LOG(info) << "Desktop Takeover active on ["sv << state.target_output
                     << "] with "sv << state.workspaces.size() << " workspace(s) and "sv
-                    << state.monitors.size() << " physical monitor(s) powered off"sv;
+                    << state.monitors.size() << " physical monitor(s) off the layout"sv;
     result.ready = true;
     result.recovery_state = std::move(state);
     return result;
@@ -692,10 +841,44 @@ namespace desktop_takeover {
       return true;
     }
     bool commands_succeeded = true;
+    // Takeover took the physical monitors off the layout to confine the
+    // pointer; they come back before anything else. Hyprland applies a
+    // monitor rule on its next frame, and a dpms naming an output it cannot
+    // find hits every enabled one — dpms and the moves must wait until the
+    // outputs are observably back, or a panel that was asleep could blank
+    // the streamed output on its way in.
     for (const auto &monitor : state.monitors) {
-      if (monitor.dpms_on) {
-        commands_succeeded = set_dpms(monitor.name, true) && commands_succeeded;
+      commands_succeeded = set_monitor_enabled(monitor, true) && commands_succeeded;
+    }
+    bool monitors_back = false;
+    int consecutive_presences = 0;
+    const auto return_deadline = std::chrono::steady_clock::now() + std::chrono::seconds {4};
+    for (int attempt = 0; attempt < 20 && std::chrono::steady_clock::now() < return_deadline; ++attempt) {
+      const auto observed = observe_monitors();
+      const bool present = observed &&
+        std::all_of(state.monitors.begin(), state.monitors.end(), [&](const auto &recorded) {
+          return std::any_of(observed->begin(), observed->end(), [&](const auto &candidate) {
+            return candidate.state.name == recorded.name;
+          });
+        });
+      if (present) {
+        if (++consecutive_presences >= 2) {
+          monitors_back = true;
+          break;
+        }
+      } else {
+        consecutive_presences = 0;
       }
+      std::this_thread::sleep_for(std::chrono::milliseconds {50});
+    }
+    if (!monitors_back) {
+      set_error(error, "Desktop Takeover re-enabled its monitors but they never returned to the layout.");
+      return false;
+    }
+    for (const auto &monitor : state.monitors) {
+      // Re-enabling an output can wake its panel, so power is set to the
+      // recorded state rather than assumed.
+      commands_succeeded = set_dpms(monitor.name, monitor.dpms_on) && commands_succeeded;
     }
 
     auto current = observe_workspaces();

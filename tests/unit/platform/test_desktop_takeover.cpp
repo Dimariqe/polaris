@@ -10,13 +10,18 @@
 
 TEST(DesktopTakeover, ParsesMonitorPowerAndWorkspacePlacement) {
   const auto monitors = desktop_takeover::parse_monitors(R"json([
-    {"name":"DP-3","dpmsStatus":true,"focused":true},
+    {"name":"DP-3","dpmsStatus":true,"focused":true,"x":2048,"y":0,"width":2560,"height":1440,"refreshRate":240.002,"scale":1.25},
     {"name":"HEADLESS-POLARIS-42-1","dpmsStatus":true}
   ])json");
   ASSERT_TRUE(monitors);
   ASSERT_EQ(monitors->size(), 2u);
   EXPECT_EQ(monitors->front().name, "DP-3");
   EXPECT_TRUE(monitors->front().dpms_on);
+  EXPECT_EQ(monitors->front().x, 2048);
+  EXPECT_EQ(monitors->front().y, 0);
+  EXPECT_EQ(monitors->front().mode, "2560x1440@240");
+  EXPECT_DOUBLE_EQ(monitors->front().scale, 1.25);
+  EXPECT_EQ(monitors->back().mode, "") << "A monitor that reports no mode restores only what it reported";
 
   const auto workspaces = desktop_takeover::parse_workspaces(R"json([
     {"id":1,"name":"1","monitor":"DP-3"},
@@ -55,7 +60,7 @@ TEST(DesktopTakeover, RoundTripsDurableRecoveryState) {
     .active = true,
     .target_output = "HEADLESS-POLARIS-42-1",
     .fallback_monitor = "DP-3",
-    .monitors = {{"DP-3", true}, {"HDMI-A-1", true}},
+    .monitors = {{"DP-3", true, 2048, 0, "2560x1440@240", 1.25}, {"HDMI-A-1", true}},
     .workspaces = {{1, "1", "DP-3"}, {-99, "special:scratch", "HDMI-A-1"}},
   };
   const auto parsed = desktop_takeover::parse_state(
@@ -188,6 +193,47 @@ TEST(DesktopTakeover, LuaDispatcherRefusesDispatchesTakeoverNeverIssues) {
   EXPECT_FALSE(desktop_takeover::lua_dispatcher({"dpms", "on"}));
   EXPECT_FALSE(desktop_takeover::lua_dispatcher({"exec", "firefox"}));
   EXPECT_FALSE(desktop_takeover::lua_dispatcher({}));
+}
+
+TEST(DesktopTakeover, TranslatesMonitorLayoutStateForLuaConfig) {
+  desktop_takeover::monitor_state_t plain {
+    "DP-2",
+    true,
+  };
+  EXPECT_EQ(
+    desktop_takeover::lua_monitor_state(plain, false),
+    std::optional<std::string> {"hl.monitor({ output = \"DP-2\", disabled = true })"}
+  ) << "Disabling carries no geometry: the output is leaving the layout";
+
+  desktop_takeover::monitor_state_t placed {
+    "DP-2",
+    true,
+    2048,
+    0,
+    "2560x1440@240",
+    1.25,
+  };
+  EXPECT_EQ(
+    desktop_takeover::lua_monitor_state(placed, true),
+    std::optional<std::string> {
+      "hl.monitor({ output = \"DP-2\", disabled = false, position = \"2048x0\", "
+      "mode = \"2560x1440@240\", scale = 1.25 })"
+    }
+  ) << "Enabling re-states the recorded geometry so a desc: or catch-all rule cannot pull it to defaults";
+
+  desktop_takeover::monitor_state_t quoted {
+    "a\"b",
+    true,
+  };
+  EXPECT_EQ(
+    desktop_takeover::lua_monitor_state(quoted, false),
+    std::optional<std::string> {"hl.monitor({ output = \"a\\\"b\", disabled = true })"}
+  );
+  desktop_takeover::monitor_state_t unsafe {
+    "DP 2",
+    true,
+  };
+  EXPECT_FALSE(desktop_takeover::lua_monitor_state(unsafe, false));
 }
 
 TEST(DesktopTakeover, LuaDispatcherRefusesArgumentsItCannotNameSafely) {

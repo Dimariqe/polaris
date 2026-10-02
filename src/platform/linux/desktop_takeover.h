@@ -15,6 +15,13 @@ namespace desktop_takeover {
   struct monitor_state_t {
     std::string name;
     bool dpms_on = true;
+    // Geometry re-stated when the output returns to the layout: hl.monitor
+    // re-enables from a rule named like the connector, so an output placed by
+    // a desc: or catch-all rule would come back at defaults.
+    int x = 0;
+    int y = 0;
+    std::string mode;  // "WxH@R", as Hyprland writes a mode
+    double scale = 1.0;
 
     bool operator==(const monitor_state_t &) const = default;
   };
@@ -74,6 +81,15 @@ namespace desktop_takeover {
    * safe-token check.
    */
   std::optional<std::string> lua_dispatcher(const std::vector<std::string> &arguments);
+
+  /**
+   * Build the hl.monitor expression that puts an output on or off a Lua-config
+   * Hyprland's layout, or nullopt when the output name fails the safe-token
+   * check. A disabled output leaves the layout, which confines the pointer;
+   * enabling re-states the recorded geometry so a desc: or catch-all rule
+   * cannot pull the output back at defaults.
+   */
+  std::optional<std::string> lua_monitor_state(const monitor_state_t &monitor, bool enabled);
 
   /** True when every recorded workspace is on the takeover target. */
   bool takeover_layout_matches(
