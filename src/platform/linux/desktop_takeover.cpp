@@ -94,6 +94,36 @@ namespace desktop_takeover {
       }
     }
 
+    // Geometry is read the same way by the pure parser and the live observer,
+    // so a recorded monitor carries exactly what was on screen — begin()
+    // observes through observe_monitors(), and a record whose geometry was
+    // never read would be re-stated as defaults on the way back.
+    void read_monitor_geometry(const json &item, monitor_state_t &monitor) {
+      if (item.contains("x") && item["x"].is_number_integer()) {
+        monitor.x = item["x"].get<int>();
+      }
+      if (item.contains("y") && item["y"].is_number_integer()) {
+        monitor.y = item["y"].get<int>();
+      }
+      if (item.contains("scale") && item["scale"].is_number()) {
+        monitor.scale = item["scale"].get<double>();
+        if (monitor.scale <= 0) {
+          monitor.scale = 1.0;
+        }
+      }
+      if (item.contains("width") && item["width"].is_number_integer() &&
+          item.contains("height") && item["height"].is_number_integer()) {
+        monitor.mode = std::to_string(item["width"].get<int>()) + "x" +
+                       std::to_string(item["height"].get<int>());
+        if (item.contains("refreshRate") && item["refreshRate"].is_number()) {
+          const auto refresh = std::lround(item["refreshRate"].get<double>());
+          if (refresh > 0) {
+            monitor.mode += "@" + std::to_string(refresh);
+          }
+        }
+      }
+    }
+
     std::optional<std::vector<monitor_observation_t>> observe_monitors() {
       const auto root = hyprctl_json("monitors");
       if (!root || !root->is_array()) {
@@ -115,6 +145,7 @@ namespace desktop_takeover {
           }
           monitor.state.dpms_on = item["dpmsStatus"].get<bool>();
         }
+        read_monitor_geometry(item, monitor.state);
         if (item.contains("disabled")) {
           if (!item["disabled"].is_boolean()) {
             return std::nullopt;
@@ -347,29 +378,7 @@ namespace desktop_takeover {
           }
           monitor.dpms_on = item["dpmsStatus"].get<bool>();
         }
-        if (item.contains("x") && item["x"].is_number_integer()) {
-          monitor.x = item["x"].get<int>();
-        }
-        if (item.contains("y") && item["y"].is_number_integer()) {
-          monitor.y = item["y"].get<int>();
-        }
-        if (item.contains("scale") && item["scale"].is_number()) {
-          monitor.scale = item["scale"].get<double>();
-          if (monitor.scale <= 0) {
-            monitor.scale = 1.0;
-          }
-        }
-        if (item.contains("width") && item["width"].is_number_integer() &&
-            item.contains("height") && item["height"].is_number_integer()) {
-          monitor.mode = std::to_string(item["width"].get<int>()) + "x" +
-                         std::to_string(item["height"].get<int>());
-          if (item.contains("refreshRate") && item["refreshRate"].is_number()) {
-            const auto refresh = std::lround(item["refreshRate"].get<double>());
-            if (refresh > 0) {
-              monitor.mode += "@" + std::to_string(refresh);
-            }
-          }
-        }
+        read_monitor_geometry(item, monitor);
         monitors.emplace_back(std::move(monitor));
       }
       return monitors;
@@ -590,12 +599,13 @@ namespace desktop_takeover {
     std::snprintf(scale_text, sizeof(scale_text), "%g", monitor.scale);
     std::string expression = "hl.monitor({ output = " + lua_quote(monitor.name) +
                              ", disabled = " + (enabled ? "false" : "true");
-    if (enabled) {
+    // Geometry is re-stated only when it was actually observed: a record
+    // without a mode came from a monitor that reported none, and re-stating
+    // defaults would pull a desc: or catch-all-placed output off its rule.
+    if (enabled && !monitor.mode.empty()) {
       expression += ", position = \"" + std::to_string(monitor.x) + "x" +
                     std::to_string(monitor.y) + "\"";
-      if (!monitor.mode.empty()) {
-        expression += ", mode = " + lua_quote(monitor.mode);
-      }
+      expression += ", mode = " + lua_quote(monitor.mode);
       expression += ", scale = " + std::string {scale_text};
     }
     expression += " })";

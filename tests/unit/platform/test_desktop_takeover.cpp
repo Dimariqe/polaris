@@ -204,6 +204,10 @@ TEST(DesktopTakeover, TranslatesMonitorLayoutStateForLuaConfig) {
     desktop_takeover::lua_monitor_state(plain, false),
     std::optional<std::string> {"hl.monitor({ output = \"DP-2\", disabled = true })"}
   ) << "Disabling carries no geometry: the output is leaving the layout";
+  EXPECT_EQ(
+    desktop_takeover::lua_monitor_state(plain, true),
+    std::optional<std::string> {"hl.monitor({ output = \"DP-2\", disabled = false })"}
+  ) << "A monitor that reported no geometry comes back without overriding its rule";
 
   desktop_takeover::monitor_state_t placed {
     "DP-2",
