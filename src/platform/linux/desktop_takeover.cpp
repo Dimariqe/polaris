@@ -135,14 +135,31 @@ namespace desktop_takeover {
           monitor.scale = 1.0;
         }
       }
+      if (item.contains("transform") && item["transform"].is_number_integer()) {
+        monitor.transform = item["transform"].get<int>();
+      }
+      if (item.contains("vrr") && item["vrr"].is_boolean()) {
+        monitor.vrr = item["vrr"].get<bool>();
+      }
       if (item.contains("width") && item["width"].is_number_integer() &&
           item.contains("height") && item["height"].is_number_integer()) {
         monitor.mode = std::to_string(item["width"].get<int>()) + "x" +
                        std::to_string(item["height"].get<int>());
         if (item.contains("refreshRate") && item["refreshRate"].is_number()) {
-          const auto refresh = std::lround(item["refreshRate"].get<double>());
-          if (refresh > 0) {
-            monitor.mode += "@" + std::to_string(refresh);
+          // A panel offering both 59.94 and 60 exists, and rounding to the
+          // nearest whole hertz picks the other one; decimals keep the mode
+          // the monitor was actually running.
+          char refresh_text[32];
+          std::snprintf(refresh_text, sizeof(refresh_text), "%.3f", item["refreshRate"].get<double>());
+          std::string_view refresh {refresh_text};
+          while (refresh.size() > 1 && refresh.back() == '0') {
+            refresh.remove_suffix(1);
+          }
+          if (refresh.back() == '.') {
+            refresh.remove_suffix(1);
+          }
+          if (refresh != "0") {
+            monitor.mode += "@" + std::string {refresh};
           }
         }
       }
@@ -284,10 +301,11 @@ namespace desktop_takeover {
           hyprctl_replies_ok({"hyprctl", "eval", *lua_state})) {
         return true;
       }
-      // The keyword form is the legacy-config spelling; it only runs after
+      // The keyword rule is the legacy-config spelling; it only runs after
       // eval failed to answer ok, which on a Lua config is every time.
-      return hyprctl_replies_ok({"hyprctl", "keyword", "monitor",
-                                 monitor.name + (enabled ? ",enable" : ",disable")});
+      const auto keyword_rule = keyword_monitor_rule(monitor, enabled);
+      return keyword_rule.has_value() &&
+             hyprctl_replies_ok({"hyprctl", "keyword", "monitor", *keyword_rule});
     }
 
     bool move_workspace(const workspace_state_t &workspace, std::string_view monitor) {
@@ -500,6 +518,12 @@ namespace desktop_takeover {
             monitor.scale = 1.0;
           }
         }
+        if (item.contains("transform") && item["transform"].is_number_integer()) {
+          monitor.transform = item["transform"].get<int>();
+        }
+        if (item.contains("vrr") && item["vrr"].is_boolean()) {
+          monitor.vrr = item["vrr"].get<bool>();
+        }
         state.monitors.emplace_back(std::move(monitor));
       }
       for (const auto &item : root["workspaces"]) {
@@ -559,6 +583,8 @@ namespace desktop_takeover {
         {"y", monitor.y},
         {"mode", monitor.mode},
         {"scale", monitor.scale},
+        {"transform", monitor.transform},
+        {"vrr", monitor.vrr},
       });
     }
     for (const auto &workspace : state.workspaces) {
@@ -654,14 +680,38 @@ namespace desktop_takeover {
     // Geometry is re-stated only when it was actually observed: a record
     // without a mode came from a monitor that reported none, and re-stating
     // defaults would pull a desc: or catch-all-placed output off its rule.
+    // Rotation travels with the rest — without it a portrait monitor comes
+    // back landscape.
     if (enabled && !monitor.mode.empty()) {
       expression += ", position = \"" + std::to_string(monitor.x) + "x" +
                     std::to_string(monitor.y) + "\"";
       expression += ", mode = " + lua_quote(monitor.mode);
       expression += ", scale = " + std::string {scale_text};
+      expression += ", transform = " + std::to_string(monitor.transform);
+      expression += ", vrr = " + std::string {monitor.vrr ? "1" : "0"};
     }
     expression += " })";
     return expression;
+  }
+
+  std::optional<std::string> keyword_monitor_rule(const monitor_state_t &monitor, bool enabled) {
+    if (!safe_token(monitor.name)) {
+      return std::nullopt;
+    }
+    if (!enabled) {
+      return monitor.name + ",disable";
+    }
+    // A bare ",enable" never works here: the legacy parser reads the field as
+    // a resolution and answers "invalid resolution", landing the rule at
+    // preferred/auto/auto anyway. State what was recorded — or the auto forms
+    // when nothing was observed.
+    if (monitor.mode.empty()) {
+      return monitor.name + ",preferred,auto,auto";
+    }
+    char scale_text[32];
+    std::snprintf(scale_text, sizeof(scale_text), "%g", monitor.scale);
+    return monitor.name + "," + monitor.mode + "," + std::to_string(monitor.x) + "x" +
+           std::to_string(monitor.y) + "," + scale_text;
   }
 
   bool takeover_layout_matches(
@@ -910,7 +960,6 @@ namespace desktop_takeover {
     for (const auto &monitor : state.monitors) {
       commands_succeeded = set_monitor_enabled(monitor, true) && commands_succeeded;
     }
-    bool monitors_back = false;
     int consecutive_presences = 0;
     const auto return_deadline = std::chrono::steady_clock::now() + std::chrono::seconds {4};
     for (int attempt = 0; attempt < 20 && std::chrono::steady_clock::now() < return_deadline; ++attempt) {
@@ -923,7 +972,6 @@ namespace desktop_takeover {
         });
       if (present) {
         if (++consecutive_presences >= 2) {
-          monitors_back = true;
           break;
         }
       } else {
@@ -931,14 +979,38 @@ namespace desktop_takeover {
       }
       std::this_thread::sleep_for(std::chrono::milliseconds {50});
     }
-    if (!monitors_back) {
-      set_error(error, "Desktop Takeover re-enabled its monitors but they never returned to the layout.");
+    const auto back = observe_monitors();
+    if (!back) {
+      set_error(error, "Desktop Takeover could not read the layout while bringing its monitors back.");
       return false;
     }
+    std::set<std::string> returned;
+    for (const auto &candidate : *back) {
+      returned.insert(candidate.state.name);
+    }
+    std::vector<std::string> missing;
+    // A monitor that never came back — unplugged mid-session, or behind a KVM
+    // switch — must not strand the rest: everything that did return is still
+    // powered and placed below, and the missing one names itself in the
+    // error so the recovery record stays for the next start.
+    for (const auto &recorded : state.monitors) {
+      if (!returned.contains(recorded.name)) {
+        missing.push_back(recorded.name);
+      }
+    }
+    std::string missing_line;
+    for (const auto &name : missing) {
+      if (!missing_line.empty()) {
+        missing_line += ' ';
+      }
+      missing_line += name;
+    }
     for (const auto &monitor : state.monitors) {
-      // Re-enabling an output can wake its panel, so power is set to the
-      // recorded state rather than assumed.
-      commands_succeeded = set_dpms(monitor.name, monitor.dpms_on) && commands_succeeded;
+      if (returned.contains(monitor.name)) {
+        // Re-enabling an output can wake its panel, so power is set to the
+        // recorded state rather than assumed.
+        commands_succeeded = set_dpms(monitor.name, monitor.dpms_on) && commands_succeeded;
+      }
     }
 
     auto current = observe_workspaces();
@@ -968,6 +1040,13 @@ namespace desktop_takeover {
         }
         commands_succeeded = move_workspace(workspace, state.fallback_monitor) && commands_succeeded;
       }
+    }
+    if (!missing.empty()) {
+      // The moves above still ran for the monitors that returned; a missing
+      // one can never verify, so its record stays rather than reporting a
+      // restoration that did not happen.
+      set_error(error, "Desktop Takeover could not bring [" + missing_line + "] back to the layout; recovery state was retained.");
+      return false;
     }
 
     // Hyprland dispatch success means accepted, not necessarily already

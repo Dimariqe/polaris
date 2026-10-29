@@ -22,6 +22,8 @@ namespace desktop_takeover {
     int y = 0;
     std::string mode;  // "WxH@R", as Hyprland writes a mode
     double scale = 1.0;
+    int transform = 0;  // Hyprland's rotation id; a portrait monitor is not 0
+    bool vrr = false;
 
     bool operator==(const monitor_state_t &) const = default;
   };
@@ -100,6 +102,16 @@ namespace desktop_takeover {
    * cannot pull the output back at defaults.
    */
   std::optional<std::string> lua_monitor_state(const monitor_state_t &monitor, bool enabled);
+
+  /**
+   * Build the legacy `hyprctl keyword monitor` rule for the same job, or
+   * nullopt when the output name fails the safe-token check. A bare
+   * ",enable" is not a rule a legacy parser understands — it reads the word
+   * as a resolution and answers "invalid resolution" — so enabling always
+   * states mode, position and scale, falling back to preferred/auto/auto
+   * when nothing was observed.
+   */
+  std::optional<std::string> keyword_monitor_rule(const monitor_state_t &monitor, bool enabled);
 
   /** True when every recorded workspace is on the takeover target. */
   bool takeover_layout_matches(

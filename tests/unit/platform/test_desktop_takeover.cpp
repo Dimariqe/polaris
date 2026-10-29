@@ -14,7 +14,7 @@
 
 TEST(DesktopTakeover, ParsesMonitorPowerAndWorkspacePlacement) {
   const auto monitors = desktop_takeover::parse_monitors(R"json([
-    {"name":"DP-3","dpmsStatus":true,"focused":true,"x":2048,"y":0,"width":2560,"height":1440,"refreshRate":240.002,"scale":1.25},
+    {"name":"DP-3","dpmsStatus":true,"focused":true,"x":2048,"y":0,"width":2560,"height":1440,"refreshRate":240.002,"scale":1.25,"transform":1,"vrr":true},
     {"name":"HEADLESS-POLARIS-42-1","dpmsStatus":true}
   ])json");
   ASSERT_TRUE(monitors);
@@ -23,9 +23,17 @@ TEST(DesktopTakeover, ParsesMonitorPowerAndWorkspacePlacement) {
   EXPECT_TRUE(monitors->front().dpms_on);
   EXPECT_EQ(monitors->front().x, 2048);
   EXPECT_EQ(monitors->front().y, 0);
-  EXPECT_EQ(monitors->front().mode, "2560x1440@240");
+  EXPECT_EQ(monitors->front().mode, "2560x1440@240.002");
   EXPECT_DOUBLE_EQ(monitors->front().scale, 1.25);
+  EXPECT_EQ(monitors->front().transform, 1);
+  EXPECT_TRUE(monitors->front().vrr);
   EXPECT_EQ(monitors->back().mode, "") << "A monitor that reports no mode restores only what it reported";
+
+  const auto rounded = desktop_takeover::parse_monitors(
+    R"json([{"name":"DP-4","width":1920,"height":1080,"refreshRate":59.951}])json");
+  ASSERT_TRUE(rounded);
+  EXPECT_EQ(rounded->front().mode, "1920x1080@59.951")
+    << "A panel offering both 59.94 and 60 keeps the mode it was running, not the rounded one";
 
   const auto workspaces = desktop_takeover::parse_workspaces(R"json([
     {"id":1,"name":"1","monitor":"DP-3"},
@@ -189,7 +197,7 @@ TEST(DesktopTakeover, RoundTripsDurableRecoveryState) {
     .active = true,
     .target_output = "HEADLESS-POLARIS-42-1",
     .fallback_monitor = "DP-3",
-    .monitors = {{"DP-3", true, 2048, 0, "2560x1440@240", 1.25}, {"HDMI-A-1", true}},
+    .monitors = {{"DP-3", true, 2048, 0, "2560x1440@240.002", 1.25, 1, true}, {"HDMI-A-1", true}},
     .workspaces = {{1, "1", "DP-3"}, {-99, "special:scratch", "HDMI-A-1"}},
   };
   const auto parsed = desktop_takeover::parse_state(
@@ -343,14 +351,16 @@ TEST(DesktopTakeover, TranslatesMonitorLayoutStateForLuaConfig) {
     true,
     2048,
     0,
-    "2560x1440@240",
+    "2560x1440@240.002",
     1.25,
+    1,
+    true,
   };
   EXPECT_EQ(
     desktop_takeover::lua_monitor_state(placed, true),
     std::optional<std::string> {
       "hl.monitor({ output = \"DP-2\", disabled = false, position = \"2048x0\", "
-      "mode = \"2560x1440@240\", scale = 1.25 })"
+      "mode = \"2560x1440@240.002\", scale = 1.25, transform = 1, vrr = 1 })"
     }
   ) << "Enabling re-states the recorded geometry so a desc: or catch-all rule cannot pull it to defaults";
 
@@ -367,6 +377,36 @@ TEST(DesktopTakeover, TranslatesMonitorLayoutStateForLuaConfig) {
     true,
   };
   EXPECT_FALSE(desktop_takeover::lua_monitor_state(unsafe, false));
+}
+
+TEST(DesktopTakeover, BuildsLegacyKeywordRulesForMonitorLayout) {
+  desktop_takeover::monitor_state_t placed {
+    "DP-2",
+    true,
+    2048,
+    0,
+    "2560x1440@240.002",
+    1.25,
+    1,
+    true,
+  };
+  EXPECT_EQ(
+    desktop_takeover::keyword_monitor_rule(placed, true),
+    std::optional<std::string> {"DP-2,2560x1440@240.002,2048x0,1.25"}
+  ) << "A bare ,enable reads as a resolution on a legacy config; the rule states what was recorded";
+  EXPECT_EQ(
+    desktop_takeover::keyword_monitor_rule(placed, false),
+    std::optional<std::string> {"DP-2,disable"}
+  );
+  desktop_takeover::monitor_state_t unplaced {
+    "DP-2",
+    true,
+  };
+  EXPECT_EQ(
+    desktop_takeover::keyword_monitor_rule(unplaced, true),
+    std::optional<std::string> {"DP-2,preferred,auto,auto"}
+  ) << "Nothing observed means the legacy parser's own auto forms";
+  EXPECT_FALSE(desktop_takeover::keyword_monitor_rule({"DP 2", true}, true));
 }
 
 TEST(DesktopTakeover, LuaDispatcherRefusesArgumentsItCannotNameSafely) {
