@@ -17,13 +17,13 @@ namespace desktop_takeover {
     bool dpms_on = true;
     // Geometry re-stated when the output returns to the layout: hl.monitor
     // re-enables from a rule named like the connector, so an output placed by
-    // a desc: or catch-all rule would come back at defaults.
+    // a desc: or catch-all rule would come back at defaults, and a legacy
+    // disable replaces the user's own rule for the connector outright.
     int x = 0;
     int y = 0;
     std::string mode;  // "WxH@R", as Hyprland writes a mode
     double scale = 1.0;
     int transform = 0;  // Hyprland's rotation id; a portrait monitor is not 0
-    bool vrr = false;
 
     bool operator==(const monitor_state_t &) const = default;
   };

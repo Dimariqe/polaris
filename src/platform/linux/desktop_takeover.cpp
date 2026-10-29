@@ -138,9 +138,6 @@ namespace desktop_takeover {
       if (item.contains("transform") && item["transform"].is_number_integer()) {
         monitor.transform = item["transform"].get<int>();
       }
-      if (item.contains("vrr") && item["vrr"].is_boolean()) {
-        monitor.vrr = item["vrr"].get<bool>();
-      }
       if (item.contains("width") && item["width"].is_number_integer() &&
           item.contains("height") && item["height"].is_number_integer()) {
         monitor.mode = std::to_string(item["width"].get<int>()) + "x" +
@@ -521,9 +518,6 @@ namespace desktop_takeover {
         if (item.contains("transform") && item["transform"].is_number_integer()) {
           monitor.transform = item["transform"].get<int>();
         }
-        if (item.contains("vrr") && item["vrr"].is_boolean()) {
-          monitor.vrr = item["vrr"].get<bool>();
-        }
         state.monitors.emplace_back(std::move(monitor));
       }
       for (const auto &item : root["workspaces"]) {
@@ -584,7 +578,6 @@ namespace desktop_takeover {
         {"mode", monitor.mode},
         {"scale", monitor.scale},
         {"transform", monitor.transform},
-        {"vrr", monitor.vrr},
       });
     }
     for (const auto &workspace : state.workspaces) {
@@ -688,7 +681,6 @@ namespace desktop_takeover {
       expression += ", mode = " + lua_quote(monitor.mode);
       expression += ", scale = " + std::string {scale_text};
       expression += ", transform = " + std::to_string(monitor.transform);
-      expression += ", vrr = " + std::string {monitor.vrr ? "1" : "0"};
     }
     expression += " })";
     return expression;
@@ -705,13 +697,18 @@ namespace desktop_takeover {
     // a resolution and answers "invalid resolution", landing the rule at
     // preferred/auto/auto anyway. State what was recorded — or the auto forms
     // when nothing was observed.
+    // transform travels as a named pair after scale — a bare fifth field is
+    // what the legacy parser rejects — and only when the monitor is rotated:
+    // the fresh rule NAME,disable leaves behind already says transform 0.
+    const std::string rotation =
+      monitor.transform != 0 ? ",transform," + std::to_string(monitor.transform) : std::string {};
     if (monitor.mode.empty()) {
-      return monitor.name + ",preferred,auto,auto";
+      return monitor.name + ",preferred,auto,auto" + rotation;
     }
     char scale_text[32];
     std::snprintf(scale_text, sizeof(scale_text), "%g", monitor.scale);
     return monitor.name + "," + monitor.mode + "," + std::to_string(monitor.x) + "x" +
-           std::to_string(monitor.y) + "," + scale_text;
+           std::to_string(monitor.y) + "," + scale_text + rotation;
   }
 
   bool takeover_layout_matches(
@@ -804,7 +801,10 @@ namespace desktop_takeover {
       // recorded dpms state and geometry put each one back the way it was.
       if (monitor.state.name != target_output && !monitor.disabled) {
         state.monitors.push_back(monitor.state);
-        if (state.fallback_monitor.empty() || monitor.focused) {
+        // Fallback prefers a lit monitor: asleep ones are recorded too now,
+        // and focus can sit on the headless output or an asleep panel.
+        if ((state.fallback_monitor.empty() && monitor.state.dpms_on) ||
+            (monitor.focused && monitor.state.dpms_on)) {
           state.fallback_monitor = monitor.state.name;
         }
       }
@@ -812,6 +812,10 @@ namespace desktop_takeover {
     if (state.monitors.empty()) {
       result.error = "Desktop Takeover needs at least one active physical monitor to restore later.";
       return result;
+    }
+    if (state.fallback_monitor.empty()) {
+      // Every monitor was asleep; any of them still receives the fallback.
+      state.fallback_monitor = state.monitors.front().name;
     }
     const std::set<std::string> source_names = [&]() {
       std::set<std::string> names;
